@@ -1,0 +1,1218 @@
+\documentclass{beamer}
+
+% Use metropolis theme
+\usepackage[progressbar=foot]{theme/beamerthememetropolis}
+\usepackage{minted}
+
+
+\title{Implementing lazy functional languages on stock hardware:}
+\subtitle{the Spineless Tagless G-Machine}
+
+\date{\today}
+\author{Joe Jevnik}
+\institute{Papers We Love - Boston}
+
+\begin{document}
+\maketitle
+
+\begin{frame}{Background}
+  \begin{block}{Existing abstract machines\ldots}
+    \begin{itemize}
+    \item[]<2-> are too abstract
+    \item[]<3-> don't say enough about data structure traversal
+    \item[]<4-> leave unboxed values to the code generator
+    \end{itemize}
+  \end{block}
+\end{frame}
+
+\begin{frame}{Overview}
+  \begin{enumerate}
+  \item<1-> the design space
+  \item<2-> the abstract machine (the STG language)
+  \item<3-> mapping the abstract machine onto real hardware
+  \end{enumerate}
+\end{frame}
+
+\section{Design Space}
+
+\begin{frame}{What is a Functional Language?}
+  \begin{itemize}
+  \item[]<1-> \begin{definition}[Functional Language]
+      A programming language which treats computation as the evaluation of
+      mathematical functions.
+    \end{definition}
+  \item[]<2-> \begin{block}{Examples}
+      \begin{itemize}
+      \item SML
+      \item OCaml
+      \item Scala
+      \item Haskell*
+      \end{itemize}
+    \end{block}
+  \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Features of Functional Languages}
+  \begin{onlyenv}<1>
+    \begin{block}{Higher order functions}
+      \begin{minted}{haskell}
+plusOne :: Int -> Int
+plusOne x = x + 1
+
+xs :: [Int]
+xs = [1, 2, 3]
+
+xsPlusOne :: [Int]
+xsPlusOne = map plusOne xs
+      \end{minted}
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<2-3>
+    \begin{block}{Algebraic data types}
+      \begin{onlyenv}<2>
+        \begin{minted}{haskell}
+data Maybe a = Nothing | Just a
+data List a = Nil | Cons a (List a)
+data Tuple3 a b c = MkTuple3 a b c
+data Tree a = Leaf a | Branch (Tree a) (Tree a)
+
+safeHead :: [a] -> Maybe a
+safeHead = case xs of
+    Nil             -> Nothing
+    Cons head tail -> Just head
+        \end{minted}
+      \end{onlyenv}
+
+      \begin{onlyenv}<3>
+        \begin{minted}{haskell}
+data Bool = False | True
+
+conditional :: Bool -> a -> a
+conditional p whenFalse whenTrue = case p of
+    False -> whenFalse
+    True  -> whenTrue
+        \end{minted}
+      \end{onlyenv}
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<4-6>
+    \begin{block}{Immutable data}
+      \begin{itemize}
+      \item[]<4-> \begin{minted}{haskell}
+insort value [] = [value]
+insort value (x:xs)
+    | value < x = value : x : xs
+    | otherwise = x : insort value xs
+        \end{minted}
+      \item[]<5-> \rule{\textwidth}{0.4pt} \begin{minted}{haskell}
+> let xs = [1,2,4,5]
+> insort 3 xs
+[1,2,3,4,5]
+        \end{minted}
+      \item[]<6-> \begin{minted}{haskell}
+> xs
+[1,2,4,5]
+        \end{minted}
+      \end{itemize}
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<7->
+    \begin{block}{Currying}
+      \begin{onlyenv}<7-12>
+        \begin{itemize}
+        \item[]<7-> \begin{minted}{haskell}
+> let f x y = x
+          \end{minted}
+        \item[]<8-> \begin{minted}{haskell}
+> :t f
+f :: a -> b -> a
+          \end{minted}
+        \item[]<9-> \begin{minted}{haskell}
+f :: a -> (b -> a)
+          \end{minted}
+        \item[]<10-> \begin{minted}{haskell}
+> f 1 2
+1
+          \end{minted}
+        \item[]<11-> \begin{minted}{haskell}
+> (f 1) 2
+1
+          \end{minted}
+        \item[]<12-> \begin{minted}{haskell}
+> :t f 1
+f 1 :: Num a => b -> a
+          \end{minted}
+        \end{itemize}
+      \end{onlyenv}
+
+      \begin{onlyenv}<13->
+        \begin{itemize}
+        \item[]<13-> \begin{minted}{sml}
+- fun f (x, y) = x;
+val f = fn : 'a * 'b -> 'a
+          \end{minted}
+        \item[]<14-> \begin{minted}{sml}
+- f (1, 2);
+val it = 1 : int
+          \end{minted}
+        \item[]<15-> \begin{minted}{sml}
+- f 1
+stdIn:3.1-3.4 Error: operator and operand don't agree [overload conflict]
+  operator domain: 'Z * 'Y
+  operand:         [int ty]
+  in expression:
+    f 1
+          \end{minted}
+        \end{itemize}
+      \end{onlyenv}
+    \end{block}
+  \end{onlyenv}
+\end{frame}
+
+\begin{frame}[fragile]{What is Lazy Evaluation?}
+  \begin{onlyenv}<1-2>
+    \begin{itemize}
+    \item[]<1-> \begin{definition}[Lazy Evaluation]
+        An evaluation strategy where expressions are evaluated only when their
+        result is needed. By default, all expressions result in a deferred
+        computation.
+
+        Lazy Evaluation is also known as ``call by need''.
+      \end{definition}
+    \item[]<2-> \begin{block}{Examples}
+        \begin{itemize}
+        \item Python generators
+        \item Scala \texttt{lazyval}
+        \item C++ expression templates
+        \end{itemize}
+      \end{block}
+    \end{itemize}
+  \end{onlyenv}
+
+  \begin{onlyenv}<3-6>
+    \begin{itemize}
+    \item[]<3-> \begin{minted}{haskell}
+> let x = 1 : x
+      \end{minted}
+    \item[]<4-> \begin{minted}{haskell}
+> x
+[1,1,1,1,1,1,1,1,1,1,...
+      \end{minted}
+    \item[]<5-> \begin{minted}{haskell}
+> let fibs = scanl (+) 1 $ 0 : fibs
+      \end{minted}
+      % $  this is to fix emacs latex mode
+    \item[]<6-> \begin{minted}{haskell}
+> fibs
+[1,1,2,3,5,8,13,21,34,55,...
+      \end{minted}
+    \end{itemize}
+  \end{onlyenv}
+
+  \begin{onlyenv}<7->
+    \begin{itemize}
+    \item[]<7-> \begin{minted}{haskell}
+> let xs = [0, undefined, undefined]
+      \end{minted}
+    \item[]<8-> \begin{minted}{haskell}
+> head $ map (+ 1) xs
+1
+      \end{minted}
+% $ this fixes latex mode
+    \end{itemize}
+  \end{onlyenv}
+\end{frame}
+
+\begin{frame}{Key Questions}
+  \begin{itemize}
+  \item<1-> How are function values, data values, and unevaluated
+    expressions represented?
+  \item<2-> How is function application performed?
+  \item<3-> How is case analysis performed on data structures?
+  \end{itemize}
+\end{frame}
+
+\section{Representing Values}
+
+\begin{frame}{Representing Values}
+  \begin{block}{Types of Values}
+    \begin{itemize}
+    \item Evaluated objects
+    \item Currently unevaluated expressions
+    \end{itemize}
+  \end{block}
+\end{frame}
+
+\begin{frame}[fragile]{Representing Values}
+  \begin{block}{Function values and data values look the same}
+    \begin{minted}{haskell}
+compose f g x = f (g x)
+
+gxIsFunction :: Num a => a -> a
+gxIsFunction = compose ($ 1) (+)
+
+gxIsNumber :: Num a => a -> a
+gxIsNumber = compose (+ 1) (* 2)
+    \end{minted}
+% $  this fixes latex mode
+  \end{block}
+\end{frame}
+
+\begin{frame}{Closures}
+  \begin{definition}[Closure]
+    A function paired with some bound arguments.
+  \end{definition}
+
+  \begin{definition}[Free Variable]
+    A bound argument to a \textbf{closure}.
+  \end{definition}
+\end{frame}
+
+\begin{frame}[fragile]{Representing Closures}
+  \begin{minted}{c}
+typedef struct {
+    void* (*code)(void** free_variables,
+                  void** arguments);
+    void* free_variables[];
+} closure;
+  \end{minted}
+\end{frame}
+
+\begin{frame}{Thunks}
+  \begin{definition}[Thunk]
+    A \textbf{closure} that represents a value which is currently unevaluated.
+
+    Thunks have no arguments, just \textbf{free variables}.
+  \end{definition}
+\end{frame}
+
+\begin{frame}[fragile]{Cell Model Thunks}
+  \begin{itemize}
+  \item[]<1-> \begin{minted}{c}
+typedef struct {
+    void* (*code)(void** free_variables);
+    void* value;
+    void* free_variables[];
+} cell_model_thunk;
+    \end{minted}
+  \item[]<2-> \begin{minted}{c}
+void* evaluate(cell_model_thunk* thunk) {
+    if (!thunk->value) {
+        thunk->value = \
+            thunk->code(thunk->free_variables);
+    }
+    return thunk->value;
+}
+    \end{minted}
+  \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Self-Updating Thunks}
+  \begin{itemize}
+  \item[]<1-> \begin{minted}{c}
+typedef struct {
+    void* (*code)(void** free_variables);
+    void* free_variables[];
+} self_updating_thunk;
+    \end{minted}
+  \item[]<2-> \begin{minted}{c}
+void* evaluate(self_updating_thunk* thunk) {
+    return thunk->code(thunk->free_variables);
+}
+    \end{minted}
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Update Frames}
+  \begin{definition}[Update Frame]
+    Code injected in a \textbf{self-updating thunk} to update the thunk's
+    closure to become the result or an \textbf{indirection} to the result.
+  \end{definition}
+
+  \begin{definition}[Indirection]
+    A thunk whose \texttt{code} cell points to an identity function and whose
+    \texttt{free\_variables} point to a single thunk.
+
+    This is used when a \textbf{self-updating thunk}'s result is larger than
+    the thunk itself.
+  \end{definition}
+\end{frame}
+
+\begin{frame}[fragile]{Update Frames}
+  \begin{onlyenv}<1>
+    \begin{minted}{c}
+typedef struct {
+    void* (*code)(void** free_variable);
+    void* free_variables[2];
+} closure_2;
+
+    \end{minted}
+  \end{onlyenv}
+
+  \begin{onlyenv}<2>
+    \begin{minted}{c}
+void update_small(closure_2* closure) {
+    closure_2* result = evaluate_self_updating(closure);
+
+    closure->code = result->code;
+
+    closure->free_variables[0] = \
+        result->free_variables[0];
+
+    closure->free_variables[1] = \
+        result->free_variables[1];
+}
+    \end{minted}
+  \end{onlyenv}
+\end{frame}
+
+\begin{frame}[fragile]{Update Frames}
+  \begin{minted}{c}
+typedef struct {
+    void* (*code)(void** free_variable);
+    void* free_variables[2];
+} closure_2;
+  \end{minted}
+
+  \begin{onlyenv}<1-3>
+    \begin{itemize}
+    \item[]<1-> \begin{block}{Before Update}
+        \texttt{\string{code, free\_var\_1, free\_var\_2\string}}
+      \end{block}
+    \item[]<2-> \begin{block}{After Updating (small value)}
+        \texttt{\string{Cons, head, tail\string}}
+      \end{block}
+    \item[]<3-> \begin{block}{After Updating (big value)}
+        \texttt{\string{indirection\_code, value, NULL\string}} \\
+        value: \texttt{\string{mkTuple3, a, b, c\string}}
+      \end{block}
+    \end{itemize}
+  \end{onlyenv}
+
+  \begin{onlyenv}<4->
+    \begin{minted}{c}
+void* indirection_code(void** free_variables) {
+    return free_variables[0];
+}
+
+void update_large(closure_2* closure) {
+    void* result = evaluate_self_updating(closure);
+    closure->code = indirection_code;
+    closure->free_variables[0] = result;
+    closure->free_variables[1] = NULL;
+}
+    \end{minted}
+  \end{onlyenv}
+\end{frame}
+
+\begin{frame}[fragile]{Self-Updating Thunk Tricks}
+  \begin{itemize}
+  \item[]<1-> \begin{block}{Black Hole}
+      A code pointer which throws an exception or aborts the program.
+    \end{block}
+  \item[]<2-> \begin{minted}{haskell}
+let a = b
+    b = a
+in a
+    \end{minted}
+  \item[]<3-> \begin{block}{Thread Synchronization}
+      A code pointer which queues the current thread of execution to resume when
+      the thunk is updated.
+    \end{block}
+  \end{itemize}
+\end{frame}
+
+\section{Function Application}
+
+\begin{frame}[fragile]{Currying}
+  \begin{itemize}
+  \item[]<1-> \begin{minted}{haskell}
+> let f x y = x
+    \end{minted}
+  \item[]<2-> \begin{minted}{haskell}
+> :t f
+f :: a -> b -> a
+    \end{minted}
+  \item[]<3-> \begin{minted}{haskell}
+f :: a -> (b -> a)
+    \end{minted}
+  \item[]<4-> \begin{minted}{haskell}
+> f 1 2
+1
+    \end{minted}
+  \item[]<5-> \begin{minted}{haskell}
+> (f 1) 2
+1
+    \end{minted}
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Eval/Apply}
+  \begin{enumerate}
+  \item<1-> Evaluate the function
+  \item<2-> Evaluate all of the arguments
+  \item<3-> Apply the function to the arguments
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}{Push/Enter}
+  \begin{enumerate}
+  \item<1-> Push arguments onto evaluation stack
+  \item<2-> Tail call (enter) the function
+  \item<3-> The function enters the next function without returning
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}[fragile]{Example}
+  \begin{itemize}
+  \item[]<1-> \begin{minted}{haskell}
+apply3 f x y z = f x y z
+    \end{minted}
+  \item[]<2-> \begin{block}{Eval/Apply}
+      \begin{minted}{haskell}
+((f x) y) z
+      \end{minted}
+    \end{block}
+  \item[]<3-> \begin{block}{Push/Enter}
+      \begin{minted}{haskell}
+push x, y, z
+enter f
+      \end{minted}
+    \end{block}
+  \end{itemize}
+\end{frame}
+
+\section{Data Structures}
+
+\begin{frame}[fragile]{Algebraic Data Types}
+  \begin{itemize}
+  \item[]<1-> \begin{minted}{haskell}
+data Boolean = False | True
+data List a = Nil | Cons a (List a)
+data Tuple3 a b c = MkTuple3 a b c
+data Int = MkInt Int#
+data Tree a = Leaf a | Branch (Tree a) (Tree a)
+    \end{minted}
+  \item[]<2-> \begin{minted}{haskell}
+case xs of
+  Nil            -> nilExpression
+  Cons head tail -> consExpression
+    \end{minted}
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Case Expression}
+  \begin{enumerate}
+  \item<1-> Evaluate the expression
+  \item<2-> Scrutinize the value
+  \item<3-> Select the proper alternative
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}[fragile]{Switch on Tag}
+  \begin{onlyenv}<1>
+    \begin{minted}{haskell}
+data List a = Cons a (List a)
+            | Nil
+    \end{minted}
+  \end{onlyenv}
+
+  \begin{onlyenv}<2>
+    \begin{minted}{c}
+closure* node;
+void* alternative_continuation;
+size_t case_tag;
+#define CONS_TAG 0
+void cons_code(void) {
+    case_tag = CONS_TAG;
+    jump(alternative_continuation);
+}
+#define NIL_TAG 1
+void nil_code(void) {
+    case_tag = NIL_TAG;
+    jump(alternative_continuation);
+}
+    \end{minted}
+  \end{onlyenv}
+
+  \begin{onlyenv}<3>
+    \begin{block}{Cons values}
+      \texttt{\string{cons\_code, head, tail\string}}
+    \end{block}
+    \begin{block}{Nil values}
+      \texttt{\string{nil\_code\string}}
+    \end{block}
+
+    \begin{minted}{haskell}
+case xs of
+    Cons head tail -> consAlternative
+    Nil            -> nilAlternative
+    \end{minted}
+  \end{onlyenv}
+
+  \begin{onlyenv}<4>
+    \begin{minted}{c}
+void some_list_case_expression(closure* c) {
+    alternative_continuation = alternatives;
+    node = c;
+    jump(c->code);
+}
+
+void some_list_case_expression_alternatives() {
+    switch(case_tag) {
+    case CONS_TAG:
+        /* body of `Cons` alternative */
+    case NIL_TAG:
+        /* body of `Nil` alternative */
+    }
+}
+    \end{minted}
+  \end{onlyenv}
+\end{frame}
+
+\begin{frame}[fragile]{Vectored Return}
+  \begin{onlyenv}<1>
+    \begin{minted}{c}
+void** return_vector;
+
+void cons_code(closure* free_variables) {
+    jump(return_vector[0]);
+}
+
+void nil_code(closure* free_variables) {
+    jump(return_vector[1]);
+}
+    \end{minted}
+  \end{onlyenv}
+
+  \begin{onlyenv}<2>
+    \begin{minted}{c}
+void* some_list_return_vector[] = {
+    cons_alternative,
+    nil_alternative,
+};
+
+void some_list_case_expression(closure* c) {
+    return_vector = some_list_return_vector;
+    node = c;
+    jump(c->code);
+}
+    \end{minted}
+  \end{onlyenv}
+\end{frame}
+
+\begin{frame}{Summary}
+  \begin{itemize}
+  \item[]<1-> Uniform representation of closures.
+  \item[]<2-> Cheap indirections are available when performing updates.
+  \item[]<3-> Exceptional conditions (black holes, concurrency) are handled in a
+    uniform way.
+  \item[]<4-> Multiple return conventions for constructors are available.
+  \end{itemize}
+\end{frame}
+
+\section{The STG Language}
+
+\begin{frame}{Semantics}
+  \begin{tabular}{ | l | l | }
+    \hline
+    Construct & Operational reading \\ \hline
+    Function application & Tail call \\
+    Let expression & Heap allocation \\
+    Case expression & Evaluation \\
+    Constructor application & Return to continuation \\
+    \hline
+  \end{tabular}
+\end{frame}
+
+\begin{frame}{Characteristics}
+  \begin{itemize}
+  \item[]<1-> All function and constructor arguments are atoms (variables or
+    constants).
+  \item[]<2-> All constructor calls are saturated.
+  \item[]<3-> Pattern matching is performed only by \texttt{case} expressions.
+  \item[]<4-> Unboxed values are supported.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Translating Haskell to STG}
+  \begin{onlyenv}<1-3>
+    \begin{block}{Haskell}
+      \begin{itemize}
+      \item[]<1-> \begin{minted}{haskell}
+map f []          = []
+map f (head:tail) = (f head) : (map f tail)
+        \end{minted}
+      \item[]<2-> \begin{minted}{haskell}
+map f xs = case xs of
+    []          -> []
+    (head:tail) -> f head : map f tail
+        \end{minted}
+      \item[]<3-> \begin{minted}{haskell}
+map f xs = case xs of
+    []          -> []
+    (head:tail) -> let fHead    = f head
+                       mapFTail = map f tail
+                   in fHead : mapFTail
+        \end{minted}
+      \end{itemize}
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<4>
+    \begin{block}{STG}
+      \begin{minted}{haskell}
+map = {} \n {f,xs} ->
+  case xs of
+    Nil {} -> Nil {}
+    Cons {head,tail} ->
+      let fHead    = {f,head} \u {} -> f {head}
+          mapFTail = {f,tail} \u {} -> map {f,tail}
+      in Cons {fHead,mapFTail}
+      \end{minted}
+    \end{block}
+  \end{onlyenv}
+\end{frame}
+
+\begin{frame}[fragile]{General Translation Rules}
+  \begin{onlyenv}<1>
+    \begin{block}{Replace binary application with multiple application.}
+      $$(\ldots((f\ e_1)\  e_2)\  \ldots)\ e_n
+      \Rightarrow
+      f \{e_1,e_2,\ldots,e_n\}$$
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<2>
+    \begin{block}{Saturate primitive operations and constructors with
+        $\eta$-expansion.}
+      $$C \{e_1,\ldots,e_n\}
+      \Rightarrow
+      \lambda y_1 \ldots y_m \rightarrow C \{e_1,\ldots,e_n,y_1,\ldots,y_m\}$$
+
+      where $C$ is a primitive operation or constructor of arity $n + m$.
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<3>
+    \begin{block}{Name every non-atomic function argument, and every
+        lambda-form, by adding a \texttt{let} expression.}
+      \begin{minted}{haskell}
+        f (a + 1) (b * 2) c
+      \end{minted}
+      \begin{minted}{haskell}
+        let arg1 = a + 1
+            arg2 = b * 2
+        in f arg1 arg2 c
+      \end{minted}
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<4>
+    \begin{block}{Convert the right-hand side of each \texttt{let} binding into
+        a lambda-form by adding free-variable and update-flag information.}
+      \begin{minted}{haskell}
+        let arg1 = a + 1
+            arg2 = b * 2
+        in f arg1 arg2 c
+      \end{minted}
+      \begin{minted}{haskell}
+        let arg1 = {a} \u {} -> + {a,1}
+            arg2 = {b} \u {} -> * {b,2}
+        in f {arg1,arg2,c}
+      \end{minted}
+    \end{block}
+  \end{onlyenv}
+\end{frame}
+
+\begin{frame}{Identifying Free Variables}
+  \begin{enumerate}
+  \item<1-> It is mentioned in the body of the lambda, and
+  \item<2-> it is not an argument, and
+  \item<3-> it is not bound at the top level of the program.
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}[fragile]{Closures and updates}
+  \begin{onlyenv}<1>
+    \begin{block}{Manifest function}
+      A manifest function is a lambda-form with a non-empty argument list.
+
+      Manifest functions do not require updating because they are already in
+      head normal form.
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<2>
+    \begin{block}{Partial application}
+      A partial application is a lambda-form of the form:
+
+      \begin{minted}{haskell}
+        {v1,...,vN} \n {} -> f {v1,...,vN}
+      \end{minted}
+
+      where \texttt{f} is a known \textbf{manifest function} which takes more
+      than $n$ arguments.
+
+      Partial applications do not require updating because they are already in
+      head normal form.
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<3>
+    \begin{block}{Constructors}
+      A constructor-closure is a lambda-form of the form
+
+      \begin{minted}{haskell}
+        {v1,...,vN} \n {} -> C {v1,...,vN}
+      \end{minted}
+
+      where \texttt{C} is a constructor.
+
+      Constructor code always returns to the alternative continuation so it does
+      not require updating.
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<4>
+    \begin{block}{Thunks}
+      All other lambda-forms are thunks and should have their update flag set
+      unless the compiler can prove the thunk will only be evaluated at most
+      once.
+
+      \begin{minted}{haskell}
+        f = {} \n {p,xs} ->
+          let j = {p} \n {} -> factorial {p}
+          in case xs of
+            Nil {}      -> + {j,1}
+            Cons {y,ys} -> + {j,2}
+      \end{minted}
+
+      \texttt{j} is evaluated at most once so it doesn't need to be updated.
+    \end{block}
+  \end{onlyenv}
+\end{frame}
+
+\begin{frame}[fragile]{Translating Haskell into STG}
+  \begin{itemize}
+  \item[]<1-> \begin{minted}{haskell}
+map1 f = mf
+  where mf []          = []
+        mf (head:tail) = (f head) : (mf tail)
+    \end{minted}
+  \item[]<2-> \begin{minted}{haskell}
+map1 = {} \n {f} ->
+  letrec mf = {f,mf} \n {xs} ->
+    case xs of
+      Nil {}           -> Nil {}
+      Cons {head,tail} ->
+        let fHead    = {f,head} \u {} -> f {head}
+            mapFTail = {mf,tail} \u {} -> mf {tail}
+        in Cons {fHead,mapFTail}
+  in mf
+    \end{minted}
+  \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Standard constructors}
+  \begin{itemize}
+  \item[]<1-> \begin{block}{Source}
+      \begin{minted}{haskell}
+global = 1
+myList = [global]
+      \end{minted}
+    \end{block}
+  \item[]<2-> \begin{block}{Non-standard constructor}
+      \begin{minted}{haskell}
+global = {} \n {} -> MkInt 1#
+nil = {} \n {} -> Nil {}
+myList = {} \n {} -> Cons {global,nil}
+      \end{minted}
+    \end{block}
+  \item[]<3-> \begin{block}{Standard constructor}
+      \begin{minted}{haskell}
+global = {} \n {} -> MkInt 1#
+nil = {} \n {} -> Nil {}
+myList = {global,nil} \n {} -> Cons {global,nil}
+      \end{minted}
+    \end{block}
+  \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Full laziness}
+  \begin{itemize}
+  \item[]<1-> \begin{minted}{haskell}
+f = {x} \n {y} -> let z = {x} \u {} ez
+                  in ef
+    \end{minted}
+  \item[]<2-> \begin{minted}{haskell}
+z = {x} \u {} -> ez
+f = {x,z} \n {y} -> ef
+    \end{minted}
+  \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Arithmetic and unboxed Values}
+  \begin{itemize}
+  \item[]<1-> \begin{minted}{haskell}
+data Int = MkInt Int#
+    \end{minted}
+  \item[]<2-> \begin{minted}{c}
+typedef struct {
+    void* mkint_entry_code;
+    int64_t value;
+}
+      \end{minted}
+    \item[]<3-> \begin{minted}{haskell}
+(+) = {} \n {a,b} ->
+  case a of
+    MkInt {a#} ->
+      case b of
+        MkInt {b#} -> case +# {a#,b#} of
+          sum# -> MkInt sum#
+    \end{minted}
+  \end{itemize}
+\end{frame}
+
+\section{Operational Semantics}
+
+\begin{frame}[fragile]{Operational Semantics}
+  \begin{onlyenv}<1-6>
+    \begin{block}{State}
+      \begin{enumerate}
+      \item<1-> the code
+      \item<2-> the argument stack (values)
+      \item<3-> the return stack (continuations)
+      \item<4-> the update stack (update frames)
+      \item<5-> the heap (closures)
+      \item<6-> the global environment (closures)
+      \end{enumerate}
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<7>
+    \begin{block}{Value}
+      Either a heap address or a primitive integer value.
+
+      Other kinds of primitives (like float) could be supported but it would
+      look exactly like int for the purposes of this discussion.
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<8>
+    \begin{block}{Global environment ($\sigma$)}
+      A map from name of each top-level name to the address of a closure.
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<9>
+    \begin{block}{Local environment ($\rho$)}
+      A map of each local variable name to the address of a closure.
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<10>
+    \begin{block}{$val\ \rho\ \sigma\ v$}
+      If $v$ is a primitive integer, return $Int\ v$.
+
+      If $v$ is a variable, return its \textbf{value} in $\rho$.
+
+      If $v$ is not in $\rho$ return its \textbf{value} in $\sigma$.
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<11>
+    \begin{block}{Code}
+      \begin{tabular}{ l p{6cm} }
+        $Eval\ e\ \rho$ & Evaluate expression $e$ in the environment
+                          $\rho$ and apply the value to the arguments
+                          on the argument stack. \\
+        $Enter\ a$ & Apply the closure at address $a$ to the arguments
+                     on the argument stack. \\
+        $ReturnCon\ c\ ws$ & Return the constructor $c$ applied to the
+                             values $ws$ to the continuation on the
+                             return stack. \\
+        $ReturnInt\ k$ & Return the primitive integer $k$ to the
+                         continuation on the return stack. \\
+      \end{tabular}
+    \end{block}
+  \end{onlyenv}
+\end{frame}
+
+\begin{frame}[fragile]{State Transitions}
+  \begin{onlyenv}<1>
+    \begin{block}{Initial State}
+      \begin{itemize}
+      \item all stacks are empty
+      \item the heap holds all the globally bound closures
+      \item $\sigma$ holds the addresses of the globally bound
+      \item $\sigma$ holds the address of a closure called \texttt{main}
+      \end{itemize}
+
+      \[Eval\ (main\ \{\})\ \{\}\]
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<2>
+    \begin{block}{Function Application: $Eval\ (f\ xs)\ \rho$}
+      \begin{enumerate}
+      \item push $val\ \rho\ \sigma\ xs$ onto the argument stack
+      \item let $Addr\ a = val\ \rho\ \sigma\ f$
+      \item move to $Enter\ a$
+      \item[] note: $Enter\ a$ creates a fresh $\rho$
+      \end{enumerate}
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<3>
+    \begin{block}{Entering Non-Updatable Closures: $Enter\ a$}
+      when there are at least as many arguments on the stack as there are
+      arguments to $a$\ldots
+      \begin{enumerate}
+      \item $a$ must be in the heap
+      \item update $\rho$ the free variables in $a$
+      \item pop the consumed arguments from the argument stack
+      \item update $\rho$ with the popped arguments
+      \item move to $Eval\ e\ \rho$ where $e$ is the body of $a$
+      \end{enumerate}
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<4>
+    \begin{block}{\texttt{let(rec)} Expressions:
+        $Eval\ (\texttt{let}\ x_n = v_n\ \texttt{in}\ e)$}
+      \begin{enumerate}
+      \item add all of the bound closures to the heap
+      \item add all of the entries to $\rho$
+      \item move to $Eval\ e\ \rho$
+      \end{enumerate}
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<5>
+    \begin{block}{Case Expressions: $Eval\ (\texttt{case}\ e\ \texttt{of}\
+        alts)$}
+      \begin{enumerate}
+      \item push $(alts,\rho)$ onto the return stack
+      \item move to $Eval\ e\ \rho$
+      \end{enumerate}
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<6>
+    \begin{block}{Constructor Application: $Eval\ (C\ xs)\ \rho$}
+      move to $ReturnCon\ C\ (val\ \rho\ \sigma\ xs)$
+    \end{block}
+
+    \begin{block}{$ReturnCon\ C\ vs$}
+      \begin{enumerate}
+      \item add $vs$ to $\rho$
+      \item pop $alts$ from the return stack
+      \item select the alternative whose constructor matches $C$
+      \item let $e$ = the body of the selected alternative
+      \item move to $Eval\ e\ \rho$
+      \end{enumerate}
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<7>
+    \begin{block}{Unboxed Integers: $Eval\ k$}
+      move to $ReturnInt\ k$
+    \end{block}
+
+    \begin{block}{$ReturnInt\ k$}
+      \begin{enumerate}
+      \item pop $alts$ from the return stack
+      \item select the alternative whose value matches $k$
+      \item move to $Eval\ e$
+      \end{enumerate}
+    \end{block}
+
+    \begin{block}{Built-In Operations:
+        $Eval\ (\texttt{f\# \string{a\#,b\#\string}})$}
+
+      move to $ReturnInt\ (f\#\ a\#\ b\#)$
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<8>
+    \begin{block}{Entering Updatable Closures: $Enter\ a$}
+      \begin{enumerate}
+      \item push a tuple of the argument stack, the return stack, and $a$ onto
+        the update stack
+      \item clear the old argument and return stacks
+      \item move to $Eval\ e\ \rho$ where $e$ is the body of $a$
+      \end{enumerate}
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<9>
+    \begin{block}{$ReturnCon\ C\ vs$ when the return stack is empty}
+      \begin{enumerate}
+      \item pop the top update frame from the update stack
+      \item restore the argument and return stacks from the update frame
+      \item overwrite the closure saved in the update frame to have a body of:
+        \texttt{C \string{vs\ldots\string}}
+      \item move to $ReturnCon\ C vs$
+      \end{enumerate}
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<10>
+    \begin{block}{Partial Application: $Enter\ a$}
+      when there are at less arguments on the stack than there are arguments to
+      $a$\ldots
+      \begin{enumerate}
+      \item pop the top update frame from the update stack
+      \item restore the return stack from the update frame
+      \item update the saved closure*
+      \item push all of the update frame's argument stack members onto the
+        argument stack
+      \end{enumerate}
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<11>
+    \begin{block}{Update the saved closure}
+      \begin{enumerate}
+      \item let \texttt{oldFreeVars} be the current free variables of the
+        closure saved in the update frame
+      \item let \texttt{newFreeVars} be the old argument stack members
+      \item let \texttt{remainingArgs} be the arguments of $a$ which were
+        not on the stack
+      \item let \texttt{e} be the body of $a$
+      \item overwrite the closure saved in the update frame to be:
+        \begin{minted}{haskell}
+{oldFreeVars ++ newFreeVars} \n {remainingArgs} -> e
+        \end{minted}
+      \end{enumerate}
+    \end{block}
+  \end{onlyenv}
+\end{frame}
+
+\section{Generating Code from STG}
+
+\begin{frame}{Choices?}
+  \begin{block}{Code generation options}
+    \begin{itemize}
+    \item ANSI C
+    \item GNU C\only<2>{*}
+    \item machine code
+    \end{itemize}
+  \end{block}
+\end{frame}
+
+\begin{frame}{Jumps}
+  \begin{block}{Requirements for code labels}
+    \begin{itemize}
+    \item name an arbitrary sequence of code
+    \item can be manipulated (pushed on a stack, stored in a closure, etc\ldots)
+    \item can be jumped to
+    \end{itemize}
+  \end{block}
+\end{frame}
+
+\begin{frame}[fragile]{Tiny Interpreter}
+  \begin{onlyenv}<1>
+    \begin{minted}{c}
+
+typedef void* (*(*code_label)(void))(void);
+
+void interpreter(code_label continuation) {
+    while (1) {
+        continuation = continuation();
+    }
+}
+    \end{minted}
+  \end{onlyenv}
+
+  \begin{onlyenv}<2->
+    \begin{block}{Optimizations}
+      \begin{itemize}
+      \item[]<2-> eliminate register saves
+      \item[]<3-> eliminate the frame pointer (used for C debuggers)
+      \item[]<4-> use direct jumps instead of returning continuations:
+        \begin{minted}{c}
+#define JUMP(cont) return cont
+#define JUMP(cont) \
+    asm volatile ("jump %P0" : "p" (cont))
+        \end{minted}
+      \end{itemize}
+    \end{block}
+  \end{onlyenv}
+\end{frame}
+
+\begin{frame}[fragile]{Representing Closures}
+  \begin{minted}{c}
+typedef struct {
+    code_label standard_entry_code;
+    code_label evacuation_code;
+    code_label scavenge_code;
+    /* debugging info, misc info */
+} info_table;
+
+typedef struct {
+    info_table* info;
+    void* closure_free_variables[];
+    int64_t primitive_free_variables[];
+  };
+  \end{minted}
+\end{frame}
+
+\begin{frame}{Stacks}
+  \begin{enumerate}
+  \item argument stack (closures)
+  \item return stack (code labels)
+  \item update stack (update frames)
+  \end{enumerate}
+
+  \begin{onlyenv}<1>
+    \begin{block}{One Stack}
+      All three stacks work in synchrony so we could put all the values on a
+      single stack.
+
+      This stresses the garbage collector because we would need a way to
+      identify which values are pointers to closures.
+    \end{block}
+  \end{onlyenv}
+
+  \begin{onlyenv}<2>
+    \begin{block}{Two Stacks}
+      Use one stack for pointers to closures and another stack for everything
+      else.
+
+      The ``A'' stack is the pointer stack (``A'' for Argument).
+
+      The ``B'' stack is the Basic value stack.
+    \end{block}
+  \end{onlyenv}
+\end{frame}
+
+\begin{frame}{The rest}
+  \begin{itemize}
+  \item garbage collection
+  \item black holes
+  \item compiling \texttt{case} expressions
+  \item different constructor return conventions
+  \item partial application
+  \item statically allocated closures
+  \item optimizations everywhere
+  \item ``gory'' details
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Key Ideas}
+  \begin{itemize}
+  \item<1-> \texttt{case} expressions are the only way to drive computation
+  \item<2-> all information about the shape and type of an object are controlled
+    through the entry code
+  \item<3-> control flow moves from \texttt{case} alternative to \texttt{case}
+    alternative
+  \item<4-> data structures are often synthetic
+  \end{itemize}
+\end{frame}
+
+\end{document}
